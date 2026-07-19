@@ -1,0 +1,11 @@
+# Ignore generated simulation and build artifacts
+simv
+*.vcd
+*.elf
+*.o
+*.log
+
+# Ignore editor/project files
+*.swp
+*.bak
+.DS_Store
