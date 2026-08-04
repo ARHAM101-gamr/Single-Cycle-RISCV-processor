@@ -1,103 +1,127 @@
-# RISC-V Processor: Single-Cycle Core → 5-Stage Pipeline
+# Single-Cycle RISC-V Processor (RV32I subset + custom MUL)
 
-A from-scratch implementation of a RISC-V processor in Verilog, built as a Final Year Project. The project starts with a **single-cycle datapath** (Harris & Harris style, limited RV32I subset) and documents its evolution into a **5-stage pipelined** implementation.
+A single-cycle RISC-V processor implemented in SystemVerilog, following the classic datapath from Sarah & David Harris's *Digital Design and Computer Architecture: RISC-V Edition*, extended with a **custom multiply instruction**. Built as the foundation stage of a Final Year Project that will evolve this design into a **5-stage pipelined** processor.
 
-> **Note:** This README is a starting template based on the project's current scope. Update the file structure, instruction list, and results sections with your actual repo contents before publishing.
+![Single-cycle datapath](triscv_single_cycle_full_datapatzh.png)
 
 ---
 
 ## Table of Contents
 - [Overview](#overview)
-- [Part 1: Single-Cycle Processor](#part-1-single-cycle-processor)
-- [Part 2: Evolution to 5-Stage Pipeline](#part-2-evolution-to-5-stage-pipeline)
+- [Architecture](#architecture)
+- [Module Breakdown](#module-breakdown)
+- [Control Logic](#control-logic)
+- [Supported Instructions](#supported-instructions)
+- [Custom MUL Extension](#custom-mul-extension)
 - [Repository Structure](#repository-structure)
-- [Toolchain & Build Instructions](#toolchain--build-instructions)
-- [Simulation Workflow](#simulation-workflow)
-- [Instruction Set Coverage](#instruction-set-coverage)
-- [Results & Waveforms](#results--waveforms)
-- [Future Work](#future-work)
+- [Building & Running](#building--running)
+- [Verification](#verification)
+- [Roadmap: 5-Stage Pipeline](#roadmap-5-stage-pipeline)
 - [References](#references)
 
 ---
 
 ## Overview
 
-This project implements a subset of the **RV32I base integer instruction set** in Verilog HDL, following the classic datapath design taught in *Digital Design and Computer Architecture* (Harris & Harris). It is developed and verified in two stages:
+Every instruction in this design fetches, decodes, executes, accesses memory, and writes back **within a single clock edge** — there is no instruction overlap and therefore no pipeline hazards to resolve. The tradeoff is that the clock period must be long enough to accommodate the slowest instruction's full path through the datapath (typically `lw`, which touches instruction memory, register file, ALU, and data memory in one cycle).
 
-1. **Single-Cycle Processor** — every instruction completes in exactly one clock cycle. Simple to design and verify, but clock speed is bottlenecked by the slowest instruction (typically loads/stores).
-2. **5-Stage Pipelined Processor** — the same datapath is split into **Fetch → Decode → Execute → Memory → Writeback** stages, with pipeline registers, hazard detection, and forwarding added to resolve data and control hazards introduced by pipelining.
-
-The goal is to demonstrate, in hardware, the classic architectural trade-off between single-cycle simplicity and pipelined throughput.
+This project targets a **limited RV32I subset** (see [Supported Instructions](#supported-instructions)) plus one non-standard addition: a combinational `mul` operation added to the ALU.
 
 ---
 
-## Part 1: Single-Cycle Processor
+## Architecture
 
-### Architecture
+The datapath (see diagram above) follows the standard Harris & Harris structure:
 
-The single-cycle datapath consists of the standard components:
+- **PC register (`flopr`)** — updated every clock edge to `PCPlus4` or `PCTarget` depending on `PCSrc`
+- **Instruction memory (`imem`)** — combinational, byte-addressed via `PC[31:2]`, loaded from `imem.hex` with `$readmemh`
+- **Register file (`regfile`)** — 32 × 32-bit, two combinational read ports, one clocked write port, `x0` hardwired to zero
+- **Immediate extender (`extend`)** — produces sign-extended immediates for I, S, B, and J formats
+- **ALU (`alu`)** — add, subtract, and, or, slt, and custom mul
+- **Data memory (`dmem`)** — word-addressed, synchronous write / combinational read
+- **Result mux (`mux3`)** — selects `ALUResult`, `ReadData`, or `PCPlus4` as the value written back to the register file
 
-- **Program Counter (PC)** — updated every cycle (PC+4 or branch/jump target)
-- **Instruction Memory (`imem`)** — combinational read, addressed by PC
-- **Register File** — 32 × 32-bit registers, 2 read ports / 1 write port
-- **ALU** — supports arithmetic, logic, and comparison operations required by the ISA subset
-- **Data Memory (`dmem`)** — for `LW`/`SW` style load/store instructions
-- **Control Unit** — combinational decode of `opcode`/`funct3`/`funct7` into control signals (`RegWrite`, `MemWrite`, `ALUSrc`, `ResultSrc`, `Branch`, `Jump`, etc.)
-- **Immediate Generator** — sign-extends and formats immediates for I/S/B/U/J instruction types
+Two adders compute `PC + 4` and `PC + ImmExt` (branch/jump target) in parallel every cycle; a mux selects between them based on `PCSrc`.
 
-Since everything happens combinationally within one clock edge, there are **no pipeline hazards** to handle — correctness only requires the control signals and datapath muxes to be wired correctly for each instruction type.
+---
 
-### Verification
+## Module Breakdown
 
-The single-cycle core is verified with a self-checking testbench:
-
-| File | Purpose |
+| File | Role |
 |---|---|
-| `top.v` | Top-level module instantiating the processor, `imem`, and `dmem` |
-| `imem.v` | Instruction memory, loads `imem.hex` at simulation start |
-| `dmem.v` | Data memory model |
-| `testbench.v` | Drives the clock/reset, checks results (e.g., writes to a known memory address on success) |
-| `imem.hex` | Compiled program, loaded via `$readmemh` |
-
-Test programs are written in C, cross-compiled to RV32I machine code, and converted to a `.hex` file consumable by `$readmemh`. Because the processor implements only a limited instruction subset, **every compiled binary is inspected with `objdump -d`** before use to confirm the compiler didn't emit unsupported instructions (e.g., pseudo-ops, compressed instructions, or extensions like M/A/F).
+| `top.v` | Test harness — wires `riscvsingle` to `imem` and `dmem` |
+| `riscvsingle.v` | Top-level CPU — instantiates `controller` and `datapath` |
+| `datapath.v` | PC logic, register file, immediate extend, ALU, result mux |
+| `controller.v` | Combines `maindec` and `aludec`; computes `PCSrc = (Branch & Zero) \| Jump` |
+| `maindec.v` | Main decoder — opcode → coarse control signals |
+| `aludec.v` | ALU decoder — `funct3`/`funct7`/`ALUOp` → 3-bit `ALUControl` |
+| `alu.v` | Executes add / sub / and / or / slt / mul |
+| `regfile.v` | 32×32-bit register file |
+| `extend.v` | I/S/B/J immediate sign-extension |
+| `imem.v` | Instruction memory, loads `imem.hex` |
+| `dmem.v` | Data memory |
+| `flopr.v`, `adder.v`, `mux2.v`, `mux3.v` | Generic reusable building blocks |
+| `testbench.v` | Self-checking testbench for the base instruction program |
+| `testbench_addmul.v` | Waveform-dump testbench for the `mul`-exercising program |
+| `imem.hex` | Assembled machine code for the base test program |
+| `addmul.elf` / `addmul.vcd` | Compiled binary and waveform dump for the mul test |
 
 ---
 
-## Part 2: Evolution to 5-Stage Pipeline
+## Control Logic
 
-Converting the single-cycle design into a pipeline reuses the same functional blocks (ALU, register file, control unit, immediate generator) but restructures the datapath around five overlapping stages:
+### Main decoder (`maindec.v`)
 
-| Stage | Abbreviation | Function |
+`{RegWrite, ImmSrc[1:0], ALUSrc, MemWrite, ResultSrc[1:0], Branch, ALUOp[1:0], Jump}`
+
+| Instruction | opcode | Encoding |
 |---|---|---|
-| Fetch | **IF** | Read instruction from `imem` at PC, compute PC+4 |
-| Decode | **ID** | Register file read, immediate generation, control signal decode |
-| Execute | **EX** | ALU operation, branch target/condition resolution |
-| Memory | **MEM** | Data memory read/write for loads and stores |
-| Writeback | **WB** | Write ALU result or memory data back to register file |
+| `lw` | `0000011` | `1_00_1_0_01_0_00_0` |
+| `sw` | `0100011` | `0_01_1_1_00_0_00_0` |
+| R-type | `0110011` | `1_00_0_0_00_0_10_0` |
+| `beq` | `1100011` | `0_10_0_0_00_1_01_0` |
+| `addi` | `0010011` | `1_00_1_0_00_0_10_0` |
+| `jal` | `1101111` | `1_11_0_0_10_0_00_1` |
 
-### Key additions over the single-cycle design
+### ALU decoder (`aludec.v`)
 
-1. **Pipeline Registers** — `IF/ID`, `ID/EX`, `EX/MEM`, `MEM/WB` latches carry instruction data and control signals forward each cycle so five instructions can be in flight simultaneously.
-2. **Hazard Detection Unit** — detects:
-   - **Data hazards** (RAW): an instruction needs a register value that hasn't been written back yet.
-   - **Load-use hazard**: a `LW` immediately followed by an instruction using its destination register requires a one-cycle stall, since the loaded value isn't available until MEM.
-3. **Forwarding (Bypass) Unit** — forwards ALU results from `EX/MEM` and `MEM/WB` pipeline registers directly to the ALU inputs in EX, avoiding stalls in most RAW hazard cases.
-4. **Stall & Flush Logic**:
-   - **Stalls** freeze `PC` and `IF/ID`, and insert a bubble (NOP) into `ID/EX` when a load-use hazard is detected.
-   - **Flushes** clear `IF/ID` (and sometimes `ID/EX`) when a branch/jump is resolved as taken, discarding incorrectly fetched instructions.
-5. **Control Hazard Handling** — since branch outcomes are resolved in EX (not IF), a naive pipeline fetches 1–2 wrong instructions per taken branch. This is handled via:
-   - Flushing on branch resolution (simplest, adds bubbles), and/or
-   - Static/dynamic branch prediction (stretch goal — see [Future Work](#future-work)).
+| ALUOp | Condition | ALUControl | Operation |
+|---|---|---|---|
+| `00` | — | `000` | add (`lw`/`sw`/`addi` address calc) |
+| `01` | — | `001` | subtract (`beq` comparison) |
+| `10` | `funct3=000`, `funct7=0000001` | `100` | **mul** (custom) |
+| `10` | `funct3=000`, `funct7=0100000` | `001` | sub |
+| `10` | `funct3=000`, else | `000` | add |
+| `10` | `funct3=010` | `101` | slt |
+| `10` | `funct3=110` | `011` | or |
+| `10` | `funct3=111` | `010` | and |
 
-### Design Comparison
+---
 
-| Aspect | Single-Cycle | 5-Stage Pipeline |
-|---|---|---|
-| Clock period | Set by slowest instruction (usually `LW`) | Set by slowest **stage** — much shorter |
-| Throughput | 1 instruction / N cycles (N = critical path) | ~1 instruction / cycle (ideal, no hazards) |
-| Hardware reuse | Each unit used once per instruction | Each unit used every cycle (needs separate stage-local versions where reuse would conflict) |
-| Hazards | None (no overlap) | Data hazards, load-use hazards, control hazards |
-| Complexity | Low — control logic only | Higher — hazard detection, forwarding, flushing |
+## Supported Instructions
+
+| Type | Instructions |
+|---|---|
+| R-type | `add`, `sub`, `and`, `or`, `slt`, `mul` (custom) |
+| I-type | `addi`, `lw` |
+| S-type | `sw` |
+| B-type | `beq` |
+| J-type | `jal` |
+
+This is intentionally a **limited subset** — not all of RV32I is implemented (e.g. no `xor`, `sll`, `srl`, `sra`, `sltu`, `bne`/`blt`/`bge`, `lui`/`auipc`, `jalr`). Any compiled C program must be checked with `objdump -d` before use, since unsupported instructions will silently produce incorrect results rather than an error.
+
+---
+
+## Custom MUL Extension
+
+The base Harris & Harris single-cycle design does not include multiply. This project adds it by:
+
+- Reusing the R-type opcode (`0110011`) with `funct3 = 000` and `funct7 = 0000001` (the encoding RV32M reserves for `mul`) to select a new `ALUControl = 100`.
+- Implementing `a * b` directly and combinationally inside `alu.v` alongside the existing add/sub/logic operations.
+
+This is **not** a standard RV32M implementation — a real multiplier is usually multi-cycle or pipelined internally due to its critical path. Here it's done combinationally in one cycle, which is acceptable for a single-cycle design at simulation clock speeds but would become the new critical path (and likely need its own pipeline stage or multi-cycle handling) once this design moves to a pipelined implementation.
+
+The `mul` datapath is exercised separately via `testbench_addmul.v`, which dumps a waveform (`addmul.vcd`) instead of doing register-level self-checking.
 
 ---
 
@@ -105,112 +129,97 @@ Converting the single-cycle design into a pipeline reuses the same functional bl
 
 ```
 .
-├── single_cycle/
-│   ├── top.v
-│   ├── imem.v
-│   ├── dmem.v
-│   ├── datapath.v
-│   ├── controller.v
-│   └── testbench.v
-├── pipeline/
-│   ├── top.v
-│   ├── if_stage.v
-│   ├── id_stage.v
-│   ├── ex_stage.v
-│   ├── mem_stage.v
-│   ├── wb_stage.v
-│   ├── hazard_unit.v
-│   ├── forwarding_unit.v
-│   └── testbench.v
-├── software/
-│   ├── test1.c
-│   ├── test1.hex
-│   └── ...
+├── adder.v
+├── alu.v
+├── aludec.v
+├── controller.v
+├── datapath.v
+├── dmem.v
+├── extend.v
+├── flopr.v
+├── imem.v
+├── imem.hex
+├── maindec.v
+├── mux2.v
+├── mux3.v
+├── regfile.v
+├── riscvsingle.v
+├── top.v
+├── testbench.v
+├── testbench_addmul.v
+├── addmul.elf
+├── addmul.vcd
+├── run_addmul.ps1
+├── triscv_single_cycle_full_datapatzh.png
 └── README.md
 ```
-*(Update this tree to match your actual folder layout.)*
 
 ---
 
-## Toolchain & Build Instructions
+## Building & Running
 
-### Prerequisites
-- **Verilog simulator**: Icarus Verilog (`iverilog`) or ModelSim/Questa
-- **Waveform viewer**: GTKWave
-- **RISC-V cross-compiler**: `gcc-riscv64-linux-gnu` (via WSL on Windows)
+Requires [Icarus Verilog](http://iverilog.icarus.com/) (`iverilog` / `vvp`) — SystemVerilog constructs (`logic`, `always_comb`, `always_ff`) require the `-g2005-sv` flag.
 
-### Windows / WSL note
-On Windows, the RV32I cross-compiler is easiest to run under **WSL**, since native Windows RISC-V GCC builds are inconsistent. Project files on the Windows side are reachable from WSL at a path like `/mnt/d/<project-folder>`.
-
-### C-to-Hex Pipeline
+### Base self-checking test
 
 ```bash
-# 1. Compile C to a bare-metal RV32I ELF (no standard library)
-riscv64-linux-gnu-gcc -march=rv32i -mabi=ilp32 -nostdlib -O0 -c test1.c -o test1.o
-
-# 2. Link into a flat ELF at the expected base address
-riscv64-linux-gnu-ld -Ttext 0x0 test1.o -o test1.elf
-
-# 3. Inspect the disassembly — confirm only supported instructions were emitted
-riscv64-linux-gnu-objdump -d test1.elf
-
-# 4. Extract raw machine code and convert to hex for $readmemh
-riscv64-linux-gnu-objcopy -O binary test1.elf test1.bin
-xxd -p -c4 test1.bin > test1.hex
+iverilog -g2005-sv -o simv adder.v alu.v aludec.v controller.v datapath.v dmem.v \
+    extend.v flopr.v imem.v maindec.v mux2.v mux3.v regfile.v riscvsingle.v top.v testbench.v
+vvp simv
 ```
 
-> Always run `objdump -d` before simulating — the processor supports a **limited RV32I subset**, and unsupported instructions will silently produce wrong results rather than an error.
+### MUL / waveform test (Windows PowerShell)
 
----
+```powershell
+./run_addmul.ps1
+```
 
-## Simulation Workflow
+This compiles the same core against `testbench_addmul.v`, runs 200 clock cycles, and produces `addmul.vcd` for inspection in GTKWave. On Linux/macOS the equivalent is:
 
 ```bash
-# Single-cycle
-cd single_cycle
-iverilog -o sim top.v datapath.v controller.v imem.v dmem.v testbench.v
-vvp sim
-gtkwave dump.vcd
-
-# Pipeline
-cd pipeline
-iverilog -o sim top.v if_stage.v id_stage.v ex_stage.v mem_stage.v wb_stage.v hazard_unit.v forwarding_unit.v testbench.v
-vvp sim
-gtkwave dump.vcd
+iverilog -g2005-sv -o simv adder.v alu.v aludec.v controller.v datapath.v dmem.v \
+    extend.v flopr.v imem.v maindec.v mux2.v mux3.v regfile.v riscvsingle.v top.v testbench_addmul.v
+vvp simv
+gtkwave addmul.vcd
 ```
 
-The testbench writes a known "success" value to a specific data memory address when all test instructions complete correctly — check the console output or the corresponding waveform signal to confirm a passing run.
+---
+
+## Verification
+
+`testbench.v` is self-checking:
+
+- Runs the program in `imem.hex`, which exercises `addi`, `add`, `sub`, `and`, `or`, `slt`, `beq` (both taken and not-taken), `sw`, `lw`, and `jal`.
+- The program halts by branching to itself (`beq x0, x0, 0`); the testbench detects this by watching for the PC to stop changing for 3 consecutive cycles.
+- On every store, it checks that the write to address `96` equals `6` (the expected result of the computation).
+- At halt, it checks the final register file state against expected values:
+
+  | Register | Expected |
+  |---|---|
+  | `x2` | 23 |
+  | `x3` | 12 |
+  | `x4` | 0 |
+  | `x5` | 11 |
+  | `x6` | 2 |
+  | `x7` | 6 |
+  | `x9` | 17 |
+
+- A 2000-time-unit timeout guards against the simulation hanging if the halt loop is never reached.
+
+`testbench_addmul.v` instead runs a fixed 200 cycles and dumps a full waveform (`addmul.vcd`) for manually inspecting the `mul` datapath in GTKWave, rather than doing an automated pass/fail check.
 
 ---
 
-## Instruction Set Coverage
+## Roadmap: 5-Stage Pipeline
 
-*(Fill in with your actual supported instructions.)*
+The next phase of this FYP is converting this single-cycle core into a **5-stage pipelined** processor (Fetch → Decode → Execute → Memory → Writeback). This is **planned, not yet implemented** in this repository. It will require:
 
-| Type | Instructions |
-|---|---|
-| R-type | `add`, `sub`, `and`, `or`, `xor`, `slt`, ... |
-| I-type | `addi`, `lw`, `andi`, `ori`, `slti`, ... |
-| S-type | `sw` |
-| B-type | `beq`, `bne`, ... |
-| U-type | `lui`, `auipc` |
-| J-type | `jal` |
-
----
-
-## Results & Waveforms
-
-*(Add screenshots/GIFs of GTKWave output, cycle counts for single-cycle vs. pipeline on the same test program, and any CPI/IPC measurements here.)*
-
----
-
-## Future Work
-
-- [ ] Branch prediction (static "predict not-taken" or a simple BHT)
-- [ ] Full RV32I instruction coverage
-- [ ] Hazard/forwarding coverage report (which hazard cases are tested)
-- [ ] Synthesis + timing analysis to quantify clock period improvement over single-cycle
-- [ ] Optional: extend to RV32IM (multiply/divide)
+1. **Pipeline registers** (`IF/ID`, `ID/EX`, `EX/MEM`, `MEM/WB`) to carry instruction data and control signals between stages, so multiple instructions are in flight simultaneously.
+2. **Hazard detection** for RAW data hazards, and specifically the **load-use hazard** (a `lw` followed immediately by an instruction that uses its result), which needs a stall since the loaded value isn't ready until MEM.
+3. **Forwarding/bypass paths** from `EX/MEM` and `MEM/WB` back into the EX stage ALU inputs, to resolve most data hazards without stalling.
+4. **Control hazard handling** for `beq`/`jal` — since branch outcomes resolve later than fetch, incorrectly fetched instructions must be flushed from the earlier pipeline stages.
+5. **Re-timing the custom `mul` operation** — a combinational multiply that fits in a single cycle today will likely become the critical path once each pipeline stage has a much shorter clock period, and may need to become a multi-cycle or dedicated-stage operation.
+6. Re-verification against the same architectural test program, now checked for correctness across overlapping instructions rather than sequential single-cycle execution.
 
 ---
 
