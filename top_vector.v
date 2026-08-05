@@ -22,7 +22,7 @@ module top_vector (
     input  logic        clk, reset
 );
 
-    localparam VLEN    = 128;
+    localparam VLEN    = 256;
     localparam SEW      = 32;
     localparam NUMLANES = VLEN / SEW;
 

@@ -54,7 +54,13 @@ module vlsu #(
     assign dmem_wd    = store_data[(busy ? idx : {IDXW{1'b0}})*SEW +: SEW];
     assign dmem_we    = busy && IsStore;
 
-    assign load_data = load_buf;
+    always_comb begin
+        load_data = load_buf; // default to the buffer
+        if (busy && IsLoad) begin
+            load_data[idx*SEW +: SEW] = dmem_rd; // bypass the buffer for the active element
+        end
+    end
+    
     assign Stall      = busy || starting;
     // Done pulses on the cycle the *last* element is being processed
     // (its result becomes valid at this posedge's completion)
